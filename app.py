@@ -29,9 +29,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import (HTMLResponse, FileResponse, JSONResponse, StreamingResponse,
                                RedirectResponse, Response)
 from starlette.background import BackgroundTask
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
+import custom_layout
 import layout_ranges
 import watermarked
 import media_auth
@@ -7543,6 +7544,9 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
         "title": clip.get('video_title_for_youtube_short') or '',
         "segments": segments,
         "framing": (clip.get('recipe') or {}).get('framing') or 'auto',
+        "custom_layout_active": any(
+            isinstance(recipe, dict) and recipe.get('layout_type') == 'custom'
+            for recipe in (clip.get('custom_layout_overrides') or {}).values()),
         "canonical_range": canonical_range,
         "duration": total,
         "current_file": current_file,
@@ -7578,6 +7582,9 @@ class RerenderRequest(BaseModel):
     # None = inherit the recipe's framing (so plain trims keep the look);
     # 'auto' resets to the classifier; 'full'/'track' force a layout.
     framing: Optional[str] = None
+    # The editor displays AUTO by default. This distinguishes that default
+    # from an explicit user choice, so a saved Custom Layout survives recuts.
+    framing_explicit: bool = False
 
 
 # Manual framing -> reframe-engine strategy. 'full' shows the whole source
@@ -7656,6 +7663,20 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
         raise HTTPException(status_code=400,
                             detail="framing must be one of: auto, full, track")
     force_strategy = _FRAMING_STRATEGIES[framing]
+    saved_custom = clip.get('custom_layout_overrides') or {}
+    if not isinstance(saved_custom, dict):
+        saved_custom = {}
+    custom_recipes = [recipe for _key, recipe in sorted(
+        saved_custom.items(), key=lambda item: (not str(item[0]).isdigit(),
+                                                 int(item[0]) if str(item[0]).isdigit() else str(item[0])))
+        if isinstance(recipe, dict) and recipe.get('layout_type') == 'custom']
+    preserve_custom = (bool(custom_recipes) and framing == 'auto'
+                       and not req.framing_explicit)
+    rerender_custom = {'*': custom_recipes[0]} if preserve_custom else {}
+    if preserve_custom:
+        # Custom is a full-clip composition. AUTO is only the editor's
+        # untouched default here; explicit mode changes opt out of this path.
+        force_strategy = None
 
     try:
         segments = recut.normalize_segments(
@@ -7682,7 +7703,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
 
     # A framing override always re-reframes from the source: the canonical file
     # has the old layout baked into its pixels.
-    fast = (force_strategy is None
+    fast = (force_strategy is None and not bool(custom_recipes)
             and os.path.exists(canonical_path)
             and recut.within_range(segments, canonical_range['start'],
                                    canonical_range['end']))
@@ -7718,6 +7739,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             output_dir=output_dir, clean_name=clean_name,
             reframe=True, output_format=data.get('output_format', 'auto'),
             force_strategy=force_strategy,
+            custom_layout_overrides=rerender_custom,
             captions_transcript=v_transcript,
             captioner=_recut_captioner(clip),
             # Trim the source's own subtitles only when ours go back on.
@@ -7746,6 +7768,8 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
                    # path, which never reframes): captions follow them.
                    'layout_ranges': layout_ranges.read(
                        os.path.join(output_dir, _clean_recut_name))}
+        if custom_recipes and not preserve_custom:
+            updates['custom_layout_overrides'] = None
         # Per-scene manual framing is keyed by scene indices of a specific cut;
         # this render neither applied it nor can it survive a changed cut, so
         # clear it rather than let /scenes serve stale overrides against the
@@ -8042,7 +8066,8 @@ class ReframeRequest(BaseModel):
     # fraction of the source width, or {"top": f, "bottom": f} to stack two
     # regions. Fractions travel instead of pixels so the editor never needs to
     # know the source dimensions.
-    crop_overrides: Dict[str, Any]
+    crop_overrides: Dict[str, Any] = Field(default_factory=dict)
+    custom_layout_overrides: Dict[str, Any] = Field(default_factory=dict)
     reapply_captions: bool = True
 
 
@@ -8100,6 +8125,7 @@ async def get_clip_scenes(job_id: str, clip_index: int, request: Request):
     # since a re-render rebuilds from source using ONLY what it is sent, the
     # next save would silently drop every earlier adjustment.
     saved_overrides = clip.get('crop_overrides') or {}
+    saved_custom_layout_overrides = clip.get('custom_layout_overrides') or {}
     source_path = await _locate_or_fetch_source(job_id)
     if not source_path:
         raise HTTPException(
@@ -8216,6 +8242,7 @@ async def get_clip_scenes(job_id: str, clip_index: int, request: Request):
         "crop_width_fraction": round(crop_w / orig_w, 4),
         "preview_url": f"/videos/{job_id}/{preview_name}",
         "saved_overrides": saved_overrides,
+        "saved_custom_layout_overrides": saved_custom_layout_overrides,
         "scenes": scenes_out,
     }
 
@@ -8254,19 +8281,63 @@ async def reframe_clip(req: ReframeRequest, request: Request):
                 overrides[idx] = _fraction(value)
         except (KeyError, TypeError, ValueError):
             continue
-    if not overrides:
-        raise HTTPException(status_code=400,
-                            detail="No scene framing was provided.")
-
+    custom_overrides = {}
+    for key, recipe in (req.custom_layout_overrides or {}).items():
+        try:
+            idx = int(key)
+            if not isinstance(recipe, dict) or recipe.get('layout_type') != 'custom':
+                raise ValueError('layout_type must be custom')
+            if recipe.get('orientation', 'vertical') != 'vertical':
+                raise ValueError('orientation must be vertical')
+            if recipe.get('preset') not in custom_layout.PRESETS:
+                raise ValueError('unknown custom layout preset')
+            normalized = {'layout_type': 'custom', 'preset': recipe.get('preset'),
+                          'orientation': 'vertical',
+                          'editor_version': int(recipe.get('editor_version', 1))}
+            if normalized['editor_version'] not in (1, 2):
+                raise ValueError('unsupported custom layout editor version')
+            for area_name in ('area_a', 'area_b'):
+                area = recipe[area_name]
+                vals = {k: float(area[k]) for k in ('x','y','w','h','out_h_ratio','out_y_offset')}
+                if normalized['editor_version'] >= 2:
+                    vals.update({k: float(area[k]) for k in
+                                 ('out_x', 'out_y', 'out_w', 'out_h', 'scale')})
+                    vals['fit'] = str(area.get('fit', 'cover'))
+                    vals['z_index'] = int(area.get('z_index', 1 if area_name == 'area_a' else 0))
+                if any(not math.isfinite(v) for v in vals.values()
+                       if isinstance(v, (int, float))):
+                    raise ValueError('non-finite geometry')
+                if not (0 <= vals['x'] < 1 and 0 <= vals['y'] < 1 and
+                        0 < vals['w'] <= 1 and 0 < vals['h'] <= 1 and
+                        vals['x'] + vals['w'] <= 1 and vals['y'] + vals['h'] <= 1 and
+                        0 < vals['out_h_ratio'] <= 1 and
+                        0 <= vals['out_y_offset'] < 1 and
+                        vals['out_y_offset'] + vals['out_h_ratio'] <= 1.00001):
+                    raise ValueError('impossible geometry')
+                if normalized['editor_version'] >= 2 and not (
+                        0 <= vals['out_x'] < 1 and 0 <= vals['out_y'] < 1 and
+                        0 < vals['out_w'] <= 1 and 0 < vals['out_h'] <= 1 and
+                        vals['out_x'] + vals['out_w'] <= 1.00001 and
+                        vals['out_y'] + vals['out_h'] <= 1.00001 and
+                        0.05 <= vals['scale'] <= 20 and
+                        vals['fit'] in ('cover', 'contain') and vals['z_index'] in (0, 1)):
+                    raise ValueError('invalid output placement')
+                normalized[area_name] = vals
+            custom_overrides[idx] = normalized
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=400,
+                                detail=f"Invalid custom layout for scene {key}: geometry must be finite, positive, normalized, and fit the frame.")
     # Same lock as /rerender: both read-modify-write the job's metadata.json,
     # and the metadata must be read INSIDE the lock or a rerender committing
     # in between gets clobbered by a write of stale data.
     lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
     async with lock:
-        return await _reframe_locked(req, request, job, overrides)
+        return await _reframe_locked(req, request, job, overrides, custom_overrides)
 
 
-async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides):
+async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides,
+                          custom_overrides=None):
+    custom_overrides = custom_overrides or {}
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
@@ -8326,6 +8397,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             reframe=True, output_format=data.get('output_format', 'auto'),
             force_strategy=force_strategy,
             crop_overrides=overrides,
+            custom_layout_overrides=custom_overrides,
             captions_transcript=v_transcript,
             captioner=_recut_captioner(clip),
             # Trim the source's own subtitles only when ours go back on.
@@ -8346,6 +8418,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             'video_url': new_video_url,
             'recipe': new_recipe,
             'crop_overrides': {str(k): v for k, v in overrides.items()},
+            'custom_layout_overrides': {str(k): v for k, v in custom_overrides.items()},
             'layout_ranges': layout_ranges.read(os.path.join(output_dir, _clean)),
         }
         updates.update(_leaves_pro_mode(clip))

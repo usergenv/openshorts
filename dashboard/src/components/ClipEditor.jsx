@@ -107,6 +107,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     // Framing override: 'auto' (classifier) | 'full' (whole frame) | 'track'.
     const [framing, setFraming] = useState('auto');
     const [renderedFraming, setRenderedFraming] = useState('auto');
+    const [framingExplicit, setFramingExplicit] = useState(false);
     // The recipe of the currently RENDERED preview (playhead maps onto it).
     const [renderedSegments, setRenderedSegments] = useState(null);
     const [previewUrl, setPreviewUrl] = useState(null);
@@ -190,6 +191,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                 setRenderedSegments(data.segments.map((s) => ({ ...s })));
                 setFraming(data.framing || 'auto');
                 setRenderedFraming(data.framing || 'auto');
+                setFramingExplicit(false);
                 setReapplyCaptions(true);
                 setPreviewUrl(getApiUrl(`/videos/${jobId}/${data.current_file}`));
             } catch (e) {
@@ -215,8 +217,9 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     const dirty = useMemo(() => {
         if (!renderedSegments) return false;
         return JSON.stringify(segments) !== JSON.stringify(renderedSegments)
-            || framing !== renderedFraming;
-    }, [segments, renderedSegments, framing, renderedFraming]);
+            || framing !== renderedFraming
+            || (framingExplicit && edl?.custom_layout_active);
+    }, [segments, renderedSegments, framing, renderedFraming, framingExplicit, edl?.custom_layout_active]);
 
     // Trim bounds: with the source gone, cuts must stay inside the range the
     // canonical file was rendered from.
@@ -229,12 +232,13 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         [sourceAvailable, canonical],
     );
     const needsSourcePath = framing !== 'auto'
+        || edl?.custom_layout_active
         || segments.some((s) => s.start < canonical.start - 0.05 || s.end > canonical.end + 0.05);
     const invalidSegments = segments.some(outOfRange);
     const overCaps = segments.length > limits.max_segments || total > limits.max_total_seconds;
     const canRender = !rendering && segments.length > 0 && !invalidSegments && !overCaps
         && segments.every((s) => s.end - s.start >= minSeg)
-        && (framing === 'auto' || sourceAvailable);
+        && (!needsSourcePath || sourceAvailable);
 
     // ---- helpers ------------------------------------------------------------
     const snapEdge = useCallback((t, kind) => {
@@ -854,6 +858,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                     snap_to_words: false, // boundaries are already word-snapped client-side
                     reapply_captions: reapplyCaptions,
                     framing,
+                    framing_explicit: framingExplicit,
                 }),
             });
             if (!res.ok) {
@@ -865,6 +870,10 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
             setRenderedSegments(data.recipe.segments.map((s) => ({ ...s })));
             setRenderedFraming(data.framing || 'auto');
             setFraming(data.framing || 'auto');
+            setFramingExplicit(false);
+            if (framingExplicit && edl?.custom_layout_active) {
+                setEdl((current) => ({ ...current, custom_layout_active: false }));
+            }
             dispatch({ type: 'init', segments: data.recipe.segments.map((s) => ({ ...s })) });
             setPreviewUrl(withParam(getApiUrl(data.new_video_url), 't', Date.now()));
             onRerendered?.(clipIndex, data);
@@ -1484,7 +1493,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                                         type="button"
                                         title={f.hint}
                                         disabled={f.value !== 'auto' && !sourceAvailable}
-                                        onClick={() => setFraming(f.value)}
+                                        onClick={() => { setFraming(f.value); setFramingExplicit(true); }}
                                         className={`py-1.5 px-2 rounded-input border text-xs lowercase transition-colors
                                             ${framing === f.value
                                                 ? 'border-[color:var(--color-accent)] text-ink'

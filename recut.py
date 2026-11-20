@@ -265,7 +265,8 @@ def _run_ffmpeg(command):
 def perform_recut(*, input_path, segments, output_dir, clean_name,
                   reframe=False, output_format="auto", watermark=False,
                   captions_transcript=None, force_strategy=None,
-                  crop_overrides=None, runner=None, renderer=None,
+                  crop_overrides=None, custom_layout_overrides=None,
+                  runner=None, renderer=None,
                   watermarker=None, captioner=None, subtitle_band=None):
     """Render a recut clip. Returns (served_filename, clean_filename).
 
@@ -309,6 +310,7 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
                 def render(i, o, f):
                     return main_render(i, o, f, force_strategy=force_strategy,
                                        crop_overrides=crop_overrides,
+                                       custom_layout_overrides=custom_layout_overrides,
                                        subtitle_band=subtitle_band)
             if not render(work_path, out_path, output_format):
                 raise RuntimeError("reframe failed on the recut clip")

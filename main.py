@@ -1624,7 +1624,7 @@ def trim_subtitle_band(input_video, band):
 
 def render_clip(input_video, final_output_video, output_format="auto",
                 force_strategy=None, crop_overrides=None, watermark=False,
-                subtitle_band=None):
+                subtitle_band=None, custom_layout_overrides=None):
     """Route a cut clip through the right renderer for the chosen output format.
     vertical/auto -> 9:16 reframe, square -> 1:1 reframe, horizontal -> keep.
     ``force_strategy`` (e.g. 'WIDE'/'TRACK') pins every scene's layout — the
@@ -1640,14 +1640,16 @@ def render_clip(input_video, final_output_video, output_format="auto",
     trimmed = trim_subtitle_band(input_video, subtitle_band)
     try:
         return _render_clip(trimmed, final_output_video, output_format,
-                            force_strategy, crop_overrides, watermark)
+                            force_strategy, crop_overrides, watermark,
+                            custom_layout_overrides)
     finally:
         if trimmed != input_video and os.path.exists(trimmed):
             os.remove(trimmed)
 
 
 def _render_clip(input_video, final_output_video, output_format,
-                 force_strategy, crop_overrides, watermark):
+                 force_strategy, crop_overrides, watermark,
+                 custom_layout_overrides=None):
     if output_format == "horizontal":
         ok = finalize_clip_passthrough(input_video, final_output_video)
         if ok and watermark:
@@ -1657,6 +1659,7 @@ def _render_clip(input_video, final_output_video, output_format,
     return process_video_to_vertical(input_video, final_output_video, aspect_ratio=aspect,
                                      force_strategy=force_strategy,
                                      crop_overrides=crop_overrides,
+                                     custom_layout_overrides=custom_layout_overrides,
                                      watermark=watermark)
 
 
@@ -1772,7 +1775,8 @@ def mark_delivery(final_path, marker=None):
 
 
 def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPECT_RATIO,
-                              force_strategy=None, crop_overrides=None, watermark=False):
+                              force_strategy=None, crop_overrides=None, watermark=False,
+                              custom_layout_overrides=None):
     """
     Core logic to reframe a horizontal video to a target aspect ratio using
     scene detection and Active Speaker Tracking (MediaPipe).
@@ -1790,6 +1794,7 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
             result = reframe_v2.render(input_video, final_output_video, aspect_ratio,
                                        force_strategy=force_strategy,
                                        crop_overrides=crop_overrides,
+                                       custom_layout_overrides=custom_layout_overrides,
                                        watermark=watermark)
             print(f"   ⏱️ Reframe v2 total: {time.time() - t0:.1f}s")
             return result
@@ -1798,7 +1803,7 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
             # through to v1 would quietly return an automatically framed clip,
             # and the user would see their correction vanish with no reason
             # given — so surface the failure instead of discarding their input.
-            if crop_overrides or force_strategy:
+            if crop_overrides or custom_layout_overrides or force_strategy:
                 raise RuntimeError(
                     f"manual framing needs the v2 reframe engine, which failed "
                     f"({type(e).__name__}: {e})") from e
